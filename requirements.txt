@@ -9,5 +9,7 @@ langchain
 langchain-core
 langgraph
 langchain-google-genai
-mcp>=1.0.0,<2.0.0
 
+
+requests
+supabase

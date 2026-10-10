@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from app.agent.agent import agent
 from app.services.auth import get_current_user
-from app.services.mcp_warmup import warm_in_background
+
 from app.tools.recommend_unwatched_movies import CURRENT_USER_ID
 
 router = APIRouter(
@@ -112,8 +112,7 @@ async def chat(
 
     try:
 
-        # Start waking the MCP server now, while the LLM is thinking.
-        warm_in_background()
+        
 
         start_time = time.perf_counter()
 

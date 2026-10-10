@@ -1,86 +1,265 @@
 import os
-import json
 import asyncio
-import httpx
-
+import traceback
 from contextvars import ContextVar
-from dotenv import load_dotenv
-from mcp import ClientSession
-from mcp.client.streamable_http import streamable_http_client
-from langchain_core.tools import tool
+from functools import lru_cache
 
-from app.services.mcp_warmup import wait_until_awake, mark_ok
+import requests
+from dotenv import load_dotenv
+from langchain_core.tools import tool
+from supabase import create_client
 
 load_dotenv()
 
 CURRENT_USER_ID = ContextVar("CURRENT_USER_ID", default=None)
 
-MCP_SERVER_URL = os.environ["MCP_SERVER_URL"]
+TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/movie"
 
-# Cloudflare cuts requests at ~100s, so keep the total below that.
-WAKE_WAIT_SECONDS = 70.0
-RETRY_DEADLINE_SECONDS = 20.0
-RETRY_STATUS = {502, 503, 504}
+BATCH_SIZE = 100
+MAX_MOVIES = 50
+WATCHED_PAGE_SIZE = 500
 
-UNAVAILABLE_MESSAGE = (
-    "The recommendation server is starting up. "
-    "Please ask again in about a minute."
+MOVIE_COLUMNS = (
+    "imdb_id,title,release_year,rating,vote_count,bayesian_score,"
+    "genres,directors,actors,keywords,plot,poster_path,duration,"
+    "certificate,country,language,status"
 )
 
-
-def _leaf_errors(exc: BaseException):
-    if isinstance(exc, BaseExceptionGroup):
-        for sub in exc.exceptions:
-            yield from _leaf_errors(sub)
-    else:
-        yield exc
+_supabase = None
 
 
-def _is_transient(exc: BaseException) -> bool:
-    for leaf in _leaf_errors(exc):
-        if (
-            isinstance(leaf, httpx.HTTPStatusError)
-            and leaf.response.status_code in RETRY_STATUS
-        ):
-            return True
-        if isinstance(
-            leaf,
-            (
-                httpx.ConnectError,
-                httpx.ConnectTimeout,
-                httpx.ReadTimeout,
-                httpx.RemoteProtocolError,
-            ),
-        ):
-            return True
-    return False
+# ============================================================
+# SUPABASE CLIENT (created on first use, never crashes startup)
+# ============================================================
+
+def _get_supabase():
+    global _supabase
+
+    if _supabase is None:
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+
+        if not url or not key:
+            raise RuntimeError("SUPABASE_URL or SUPABASE_KEY is missing")
+
+        _supabase = create_client(url, key)
+
+    return _supabase
 
 
-async def _with_retry(fn, deadline: float, first_delay: float = 2.0,
-                      max_delay: float = 8.0):
-    loop = asyncio.get_running_loop()
-    end = loop.time() + deadline
-    delay = first_delay
-    attempt = 0
+# ============================================================
+# WATCHED MOVIES  (table: user_movie_actions)
+# ============================================================
+
+def _get_watched_imdb_ids(user_id: str) -> set[str]:
+    supabase = _get_supabase()
+
+    watched = set()
+    offset = 0
 
     while True:
-        attempt += 1
-        try:
-            return await fn()
-        except BaseException as exc:
-            if isinstance(
-                exc,
-                (KeyboardInterrupt, SystemExit, asyncio.CancelledError),
-            ):
-                raise
-            if not _is_transient(exc) or loop.time() + delay > end:
-                raise
-            print(f"[MCP RETRY] attempt {attempt}, retrying in {delay:.0f}s")
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, max_delay)
+        response = (
+            supabase.table("user_movie_actions")
+            .select("imdb_id")
+            .eq("user_id", user_id)
+            .eq("watched", True)
+            .range(offset, offset + WATCHED_PAGE_SIZE - 1)
+            .execute()
+        )
+
+        rows = response.data or []
+
+        for row in rows:
+            imdb_id = row.get("imdb_id")
+            if imdb_id:
+                watched.add(str(imdb_id).strip())
+
+        if len(rows) < WATCHED_PAGE_SIZE:
+            break
+
+        offset += len(rows)
+
+    return watched
 
 
-@tool
+# ============================================================
+# TMDB POSTER FALLBACK
+# ============================================================
+
+@lru_cache(maxsize=2000)
+def _find_tmdb_poster(title: str, release_year: int | None = None):
+    api_key = os.getenv("TMDB_API_KEY")
+
+    if not title or not api_key:
+        return None
+
+    try:
+        response = requests.get(
+            TMDB_SEARCH_URL,
+            params={
+                "api_key": api_key,
+                "query": title,
+                "include_adult": "false",
+                "language": "en-US",
+                "page": 1,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        results = response.json().get("results", [])
+
+        if release_year is not None:
+            for movie in results:
+                date = movie.get("release_date") or ""
+                try:
+                    year = int(date[:4])
+                except ValueError:
+                    continue
+                if year == release_year and movie.get("poster_path"):
+                    return movie["poster_path"]
+
+        for movie in results:
+            if movie.get("poster_path"):
+                return movie["poster_path"]
+
+    except requests.RequestException as exc:
+        print(f"[POSTER ERROR] {title}: {exc}")
+
+    return None
+
+
+# ============================================================
+# MOVIE QUERY
+# ============================================================
+
+def _build_query(
+    genre, actor, director, release_year, year_min, year_max,
+    rating_min, rating_max, min_vote_count, offset,
+):
+    query = _get_supabase().table("movies").select(MOVIE_COLUMNS)
+
+    if genre:
+        query = query.contains("genres", [genre])
+
+    if actor:
+        query = query.contains("actors", [actor])
+
+    if director:
+        query = query.contains("directors", [director])
+
+    if release_year is not None:
+        query = query.eq("release_year", release_year)
+
+    if year_min is not None:
+        query = query.gte("release_year", year_min)
+
+    if year_max is not None:
+        query = query.lte("release_year", year_max)
+
+    if rating_min is not None:
+        query = query.gte("rating", rating_min)
+
+    if rating_max is not None:
+        query = query.lte("rating", rating_max)
+
+    if min_vote_count is not None:
+        query = query.gte("vote_count", min_vote_count)
+
+    query = (
+        query.order("bayesian_score", desc=True)
+        .order("rating", desc=True)
+        .order("vote_count", desc=True)
+        .range(offset, offset + BATCH_SIZE - 1)
+    )
+
+    return query
+
+
+# ============================================================
+# SEARCH (blocking; runs in a worker thread)
+# ============================================================
+
+def _search_unwatched(
+    user_id, genre, actor, director, release_year, year_min, year_max,
+    rating_min, rating_max, min_vote_count, number_of_movies,
+):
+    watched = _get_watched_imdb_ids(user_id)
+
+    selected = []
+    seen = set()
+    offset = 0
+
+    while len(selected) < number_of_movies:
+        batch = (
+            _build_query(
+                genre, actor, director, release_year, year_min, year_max,
+                rating_min, rating_max, min_vote_count, offset,
+            )
+            .execute()
+            .data
+            or []
+        )
+
+        if not batch:
+            break
+
+        for movie in batch:
+            imdb_id = str(movie.get("imdb_id") or "").strip()
+
+            if not imdb_id or imdb_id in watched or imdb_id in seen:
+                continue
+
+            seen.add(imdb_id)
+            selected.append(movie)
+
+            if len(selected) >= number_of_movies:
+                break
+
+        offset += len(batch)
+
+        if len(batch) < BATCH_SIZE:
+            break
+
+    for movie in selected:
+        if not movie.get("poster_path"):
+            movie["poster_path"] = _find_tmdb_poster(
+                movie.get("title"),
+                movie.get("release_year"),
+            )
+
+    print(
+        f"[UNWATCHED] watched={len(watched)} "
+        f"returned={len(selected)} (n={number_of_movies})"
+    )
+
+    return selected
+
+
+def _format_for_llm(movies) -> str:
+    lines = []
+
+    for movie in movies:
+        genres = movie.get("genres") or []
+        if isinstance(genres, list):
+            genres = ", ".join(str(g) for g in genres[:3])
+
+        lines.append(
+            f"{movie.get('title')} ({movie.get('release_year')}) "
+            f"rating {movie.get('rating')} | {genres}"
+        )
+
+    return (
+        f"Found {len(movies)} unwatched movies. "
+        "Movie cards are displayed to the user automatically; "
+        "do not repeat details.\n" + "\n".join(lines)
+    )
+
+
+# ============================================================
+# LANGCHAIN TOOL
+# ============================================================
+
+@tool(response_format="content_and_artifact")
 async def recommend_unwatched_movies(
     genre: str = "",
     actor: str = "",
@@ -92,7 +271,7 @@ async def recommend_unwatched_movies(
     rating_max: float | None = None,
     min_vote_count: int | None = None,
     number_of_movies: int = 10,
-) -> str:
+) -> tuple[str, list]:
     """
     Recommend movies the authenticated user has not watched.
 
@@ -107,138 +286,38 @@ async def recommend_unwatched_movies(
     confirmation from the tool results.
     """
 
-    # Get the authenticated user's ID from server context.
     user_id = CURRENT_USER_ID.get()
 
     if not user_id:
         return (
             "Cannot recommend unwatched movies without "
-            "an authenticated user ID."
+            "an authenticated user ID.",
+            [],
         )
 
-    if not 1 <= number_of_movies <= 50:
-        return "number_of_movies must be between 1 and 50."
-
-    arguments = {
-        "user_id": user_id,
-        "number_of_movies": number_of_movies,
-    }
-
-    optional_filters = {
-        "genre": genre,
-        "actor": actor,
-        "director": director,
-        "release_year": release_year,
-        "year_min": year_min,
-        "year_max": year_max,
-        "rating_min": rating_min,
-        "rating_max": rating_max,
-        "min_vote_count": min_vote_count,
-    }
-
-    arguments.update({
-        key: value
-        for key, value in optional_filters.items()
-        if value is not None and value != ""
-    })
-
-    async def _call() -> str:
-        timeout = httpx.Timeout(30.0, connect=30.0)
-
-        async with httpx.AsyncClient(timeout=timeout) as http_client:
-            async with streamable_http_client(
-                MCP_SERVER_URL,
-                http_client=http_client,
-            ) as (read_stream, write_stream, _):
-
-                async with ClientSession(
-                    read_stream,
-                    write_stream,
-                ) as session:
-
-                    await session.initialize()
-
-                    available = await session.list_tools()
-
-                    remote_tool = next(
-                        (
-                            item
-                            for item in available.tools
-                            if item.name == "recommend_unwatched_movies"
-                        ),
-                        None,
-                    )
-
-                    if remote_tool is None:
-                        return (
-                            "The remote MCP server does not expose "
-                            "recommend_unwatched_movies."
-                        )
-
-                    # Send only parameters accepted by the MCP tool.
-                    properties = remote_tool.inputSchema.get("properties", {})
-
-                    accepted_arguments = {
-                        key: value
-                        for key, value in arguments.items()
-                        if key in properties
-                    }
-
-                    result = await session.call_tool(
-                        "recommend_unwatched_movies",
-                        arguments=accepted_arguments,
-                    )
-
-                    mark_ok()
-
-                    if result.isError:
-                        return (
-                            "The movie recommendation service "
-                            "returned an error."
-                        )
-
-                    text_parts = [
-                        item.text
-                        for item in result.content
-                        if getattr(item, "type", None) == "text"
-                    ]
-
-                    if text_parts:
-                        return "\n".join(text_parts)
-
-                    return json.dumps(
-                        result.structuredContent or {},
-                        ensure_ascii=False,
-                        default=str,
-                    )
+    if not 1 <= number_of_movies <= MAX_MOVIES:
+        return f"number_of_movies must be between 1 and {MAX_MOVIES}.", []
 
     try:
-        # Usually already awake thanks to the startup/keep-warm task.
-        if not await wait_until_awake(timeout=WAKE_WAIT_SECONDS):
-            print("[MCP TOOL] server did not wake up in time")
-            return UNAVAILABLE_MESSAGE
-
-        return await _with_retry(_call, deadline=RETRY_DEADLINE_SECONDS)
-
-    except BaseException as exc:
-        import traceback
-
-        if isinstance(
-            exc,
-            (KeyboardInterrupt, SystemExit, asyncio.CancelledError),
-        ):
-            raise
-
-        print("=== MCP TOOL ERROR ===")
-        print("MCP URL USED:", MCP_SERVER_URL)
-        traceback.print_exception(
-            type(exc),
-            exc,
-            exc.__traceback__,
-            limit=5,
+        movies = await asyncio.to_thread(
+            _search_unwatched,
+            str(user_id).strip(),
+            genre.strip() or None,
+            actor.strip() or None,
+            director.strip() or None,
+            release_year,
+            year_min,
+            year_max,
+            rating_min,
+            rating_max,
+            min_vote_count,
+            number_of_movies,
         )
+    except Exception:
+        traceback.print_exc()
+        return "Movie recommendation failed. Please try again.", []
 
-        for leaf in _leaf_errors(exc):
-            print("LEAF ERROR:", type(leaf).__name__, str(leaf)[:1000])
+    if not movies:
+        return "No unwatched movies matched the requested filters.", []
 
-        return UNAVAILABLE_MESSAGE
+    return _format_for_llm(movies), movies
