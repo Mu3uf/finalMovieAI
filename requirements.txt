@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+pydantic
+email-validator
+supabase
+langchain
+langchain-core
+langgraph
+langchain-google-genai
+mcp>=1.0.0,<2.0.0
+
