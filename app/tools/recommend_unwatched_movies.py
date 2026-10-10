@@ -1,6 +1,6 @@
-
 import os
 import json
+import asyncio
 import httpx
 
 from contextvars import ContextVar
@@ -14,6 +14,31 @@ load_dotenv()
 CURRENT_USER_ID = ContextVar("CURRENT_USER_ID", default=None)
 
 MCP_SERVER_URL = os.environ["MCP_SERVER_URL"]
+
+
+async def _wake_mcp_server(
+    url: str,
+    attempts: int = 12,
+    delay: float = 8.0,
+) -> None:
+    """Ping the MCP server until Render finishes waking it up."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for _ in range(attempts):
+            try:
+                response = await client.get(url)
+                if response.status_code not in (502, 503, 504):
+                    return
+            except httpx.HTTPError:
+                pass
+            await asyncio.sleep(delay)
+
+
+def _leaf_errors(exc: BaseException):
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            yield from _leaf_errors(sub)
+    else:
+        yield exc
 
 
 @tool
@@ -79,6 +104,9 @@ async def recommend_unwatched_movies(
     })
 
     try:
+        # Render free tier: wake the MCP server before connecting.
+        await _wake_mcp_server(MCP_SERVER_URL)
+
         timeout = httpx.Timeout(
             90.0,
             connect=90.0,
@@ -158,9 +186,11 @@ async def recommend_unwatched_movies(
                         default=str,
                     )
 
-    except Exception as exc:
+    except BaseException as exc:
         import traceback
 
+        print("=== MCP TOOL ERROR ===")
+        print("MCP URL USED:", MCP_SERVER_URL)
         traceback.print_exception(
             type(exc),
             exc,
@@ -168,15 +198,10 @@ async def recommend_unwatched_movies(
             limit=5,
         )
 
-        cause = exc
+        for leaf in _leaf_errors(exc):
+            print("LEAF ERROR:", type(leaf).__name__, str(leaf)[:1000])
 
-        while cause.__cause__ or cause.__context__:
-            cause = cause.__cause__ or cause.__context__
-
-        print(
-            "ROOT ERROR:",
-            type(cause).__name__,
-            str(cause)[:1000],
-        )
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+            raise
 
         return "Movie recommendation service unavailable."
