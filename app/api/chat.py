@@ -2,17 +2,20 @@
 # CHAT API
 # ============================================================
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+import json
 import time
-from app.agent.agent import agent
 
 from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
+
+from app.agent.agent import agent
 from app.services.auth import get_current_user
+from app.services.mcp_warmup import warm_in_background
 from app.tools.recommend_unwatched_movies import CURRENT_USER_ID
+
 router = APIRouter(
     prefix="/api/chat",
-    tags=["chat"]
+    tags=["chat"],
 )
 
 
@@ -21,7 +24,6 @@ router = APIRouter(
 # ============================================================
 
 class ChatRequest(BaseModel):
-
     message: str
 
 
@@ -35,120 +37,44 @@ def extract_movies(messages):
 
     for message in messages:
 
-        # --------------------------------------------------
         # Only inspect tool messages
-        # --------------------------------------------------
-
-        if getattr(
-            message,
-            "type",
-            None
-        ) != "tool":
-
+        if getattr(message, "type", None) != "tool":
             continue
 
-        # --------------------------------------------------
-        # NEW: full movie data comes from the artifact
-        # --------------------------------------------------
+        # Full movie data may come from the artifact
+        artifact = getattr(message, "artifact", None)
 
-        artifact = getattr(
-            message,
-            "artifact",
-            None
-        )
-
-        if isinstance(
-            artifact,
-            list
-        ) and artifact:
-
-            movies.extend(
-                artifact
-            )
-
+        if isinstance(artifact, list) and artifact:
+            movies.extend(artifact)
             continue
 
-        content = getattr(
-            message,
-            "content",
-            None
-        )
+        content = getattr(message, "content", None)
 
         if not content:
-
             continue
 
-        # --------------------------------------------------
         # Dictionary result
-        # --------------------------------------------------
-
-        if isinstance(
-            content,
-            dict
-        ):
-
-            if content.get(
-                "success"
-            ):
-
-                tool_movies = content.get(
-                    "movies",
-                    []
-                )
-
+        if isinstance(content, dict):
+            if content.get("success"):
+                tool_movies = content.get("movies", [])
                 if tool_movies:
+                    movies.extend(tool_movies)
 
-                    movies.extend(
-                        tool_movies
-                    )
-
-        # --------------------------------------------------
         # JSON string result
-        # --------------------------------------------------
-
-        elif isinstance(
-            content,
-            str
-        ):
-
+        elif isinstance(content, str):
             try:
+                data = json.loads(content)
 
-                import json
-
-                data = json.loads(
-                    content
-                )
-
-                if isinstance(
-                    data,
-                    dict
-                ):
-
-                    if data.get(
-                        "success"
-                    ):
-
-                        tool_movies = data.get(
-                            "movies",
-                            []
-                        )
-
-                        if tool_movies:
-
-                            movies.extend(
-                                tool_movies
-                            )
+                if isinstance(data, dict) and data.get("success"):
+                    tool_movies = data.get("movies", [])
+                    if tool_movies:
+                        movies.extend(tool_movies)
 
             except Exception:
-
                 continue
 
-    # ------------------------------------------------------
     # Remove duplicate movies
-    # ------------------------------------------------------
-
     unique_movies = []
-
     seen = set()
 
     for movie in movies:
@@ -159,21 +85,11 @@ def extract_movies(messages):
             or movie.get("title")
         )
 
-        if not movie_key:
-
+        if not movie_key or movie_key in seen:
             continue
 
-        if movie_key in seen:
-
-            continue
-
-        seen.add(
-            movie_key
-        )
-
-        unique_movies.append(
-            movie
-        )
+        seen.add(movie_key)
+        unique_movies.append(movie)
 
     return unique_movies
 
@@ -189,17 +105,15 @@ async def chat(
 ):
 
     if not request.message.strip():
-
         raise HTTPException(
             status_code=400,
-            detail="Message cannot be empty."
+            detail="Message cannot be empty.",
         )
 
     try:
 
-        # --------------------------------------------------
-        # Run agent
-        # --------------------------------------------------
+        # Start waking the MCP server now, while the LLM is thinking.
+        warm_in_background()
 
         start_time = time.perf_counter()
 
@@ -221,18 +135,11 @@ async def chat(
 
         elapsed = time.perf_counter() - start_time
 
-        elapsed = time.perf_counter() - start_time
-
         messages = result.get("messages", [])
 
         print(f"[CHAT DEBUG] Agent time: {elapsed:.2f} seconds")
         print(f"[CHAT DEBUG] Messages returned: {len(messages)}")
 
-
-        messages = result.get(
-            "messages",
-            []
-        )
         for message in messages:
             print("TYPE:", getattr(message, "type", None))
             print("NAME:", getattr(message, "name", None))
@@ -240,27 +147,15 @@ async def chat(
             print("-" * 50)
 
         if not messages:
-
             raise HTTPException(
                 status_code=500,
-                detail="Agent returned no messages."
+                detail="Agent returned no messages.",
             )
 
-
-        # --------------------------------------------------
         # Extract movies FIRST
-        # --------------------------------------------------
+        movies = extract_movies(messages)
 
-        movies = extract_movies(
-            messages
-        )
-
-
-        # --------------------------------------------------
         # Get AI response
-        # --------------------------------------------------
-
-
         final_message = messages[-1]
         final_content = final_message.content
 
@@ -281,52 +176,29 @@ async def chat(
         elif not isinstance(final_content, str):
             final_content = ""
 
-
-        # --------------------------------------------------
-        # Clean response
-        #
         # The movie cards already display the movie data.
-        # --------------------------------------------------
-
         if movies:
-
             final_content = (
                 f"I found {len(movies)} "
                 f"movie{'s' if len(movies) != 1 else ''} "
                 "for you."
             )
 
-
-        # --------------------------------------------------
-        # Return
-        # --------------------------------------------------
-
         return {
-
             "success": True,
-
             "message": final_content,
-
             "movies": movies,
-
-            "count": len(movies)
-
+            "count": len(movies),
         }
 
-
     except HTTPException:
-
         raise
-
 
     except Exception as e:
         import traceback
         traceback.print_exc()
 
         raise HTTPException(
-
             status_code=500,
-
-            detail=str(e)
-
+            detail=str(e),
         )

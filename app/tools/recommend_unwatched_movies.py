@@ -9,28 +9,23 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from langchain_core.tools import tool
 
+from app.services.mcp_warmup import wait_until_awake, mark_ok
+
 load_dotenv()
 
 CURRENT_USER_ID = ContextVar("CURRENT_USER_ID", default=None)
 
 MCP_SERVER_URL = os.environ["MCP_SERVER_URL"]
 
+# Cloudflare cuts requests at ~100s, so keep the total below that.
+WAKE_WAIT_SECONDS = 70.0
+RETRY_DEADLINE_SECONDS = 20.0
+RETRY_STATUS = {502, 503, 504}
 
-async def _wake_mcp_server(
-    url: str,
-    attempts: int = 12,
-    delay: float = 8.0,
-) -> None:
-    """Ping the MCP server until Render finishes waking it up."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for _ in range(attempts):
-            try:
-                response = await client.get(url)
-                if response.status_code not in (502, 503, 504):
-                    return
-            except httpx.HTTPError:
-                pass
-            await asyncio.sleep(delay)
+UNAVAILABLE_MESSAGE = (
+    "The recommendation server is starting up. "
+    "Please ask again in about a minute."
+)
 
 
 def _leaf_errors(exc: BaseException):
@@ -39,6 +34,50 @@ def _leaf_errors(exc: BaseException):
             yield from _leaf_errors(sub)
     else:
         yield exc
+
+
+def _is_transient(exc: BaseException) -> bool:
+    for leaf in _leaf_errors(exc):
+        if (
+            isinstance(leaf, httpx.HTTPStatusError)
+            and leaf.response.status_code in RETRY_STATUS
+        ):
+            return True
+        if isinstance(
+            leaf,
+            (
+                httpx.ConnectError,
+                httpx.ConnectTimeout,
+                httpx.ReadTimeout,
+                httpx.RemoteProtocolError,
+            ),
+        ):
+            return True
+    return False
+
+
+async def _with_retry(fn, deadline: float, first_delay: float = 2.0,
+                      max_delay: float = 8.0):
+    loop = asyncio.get_running_loop()
+    end = loop.time() + deadline
+    delay = first_delay
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            return await fn()
+        except BaseException as exc:
+            if isinstance(
+                exc,
+                (KeyboardInterrupt, SystemExit, asyncio.CancelledError),
+            ):
+                raise
+            if not _is_transient(exc) or loop.time() + delay > end:
+                raise
+            print(f"[MCP RETRY] attempt {attempt}, retrying in {delay:.0f}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
 
 
 @tool
@@ -103,27 +142,14 @@ async def recommend_unwatched_movies(
         if value is not None and value != ""
     })
 
-    try:
-        # Render free tier: wake the MCP server before connecting.
-        await _wake_mcp_server(MCP_SERVER_URL)
+    async def _call() -> str:
+        timeout = httpx.Timeout(30.0, connect=30.0)
 
-        timeout = httpx.Timeout(
-            90.0,
-            connect=90.0,
-        )
-
-        async with httpx.AsyncClient(
-            timeout=timeout,
-        ) as http_client:
-
+        async with httpx.AsyncClient(timeout=timeout) as http_client:
             async with streamable_http_client(
                 MCP_SERVER_URL,
                 http_client=http_client,
-            ) as (
-                read_stream,
-                write_stream,
-                _,
-            ):
+            ) as (read_stream, write_stream, _):
 
                 async with ClientSession(
                     read_stream,
@@ -150,9 +176,7 @@ async def recommend_unwatched_movies(
                         )
 
                     # Send only parameters accepted by the MCP tool.
-                    properties = (
-                        remote_tool.inputSchema.get("properties", {})
-                    )
+                    properties = remote_tool.inputSchema.get("properties", {})
 
                     accepted_arguments = {
                         key: value
@@ -164,6 +188,8 @@ async def recommend_unwatched_movies(
                         "recommend_unwatched_movies",
                         arguments=accepted_arguments,
                     )
+
+                    mark_ok()
 
                     if result.isError:
                         return (
@@ -186,8 +212,22 @@ async def recommend_unwatched_movies(
                         default=str,
                     )
 
+    try:
+        # Usually already awake thanks to the startup/keep-warm task.
+        if not await wait_until_awake(timeout=WAKE_WAIT_SECONDS):
+            print("[MCP TOOL] server did not wake up in time")
+            return UNAVAILABLE_MESSAGE
+
+        return await _with_retry(_call, deadline=RETRY_DEADLINE_SECONDS)
+
     except BaseException as exc:
         import traceback
+
+        if isinstance(
+            exc,
+            (KeyboardInterrupt, SystemExit, asyncio.CancelledError),
+        ):
+            raise
 
         print("=== MCP TOOL ERROR ===")
         print("MCP URL USED:", MCP_SERVER_URL)
@@ -201,7 +241,4 @@ async def recommend_unwatched_movies(
         for leaf in _leaf_errors(exc):
             print("LEAF ERROR:", type(leaf).__name__, str(leaf)[:1000])
 
-        if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
-            raise
-
-        return "Movie recommendation service unavailable."
+        return UNAVAILABLE_MESSAGE

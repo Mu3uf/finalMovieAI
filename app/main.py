@@ -2,6 +2,8 @@
 # FASTAPI MAIN
 # ============================================================
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -9,6 +11,18 @@ from fastapi.staticfiles import StaticFiles
 from app.api.chat import router as chat_router
 from app.api.auth import router as auth_router
 from app.api.movies import router as movies_router
+from app.services.mcp_warmup import start_keep_warm, stop_keep_warm
+
+
+# ============================================================
+# LIFESPAN (wakes the MCP server on startup)
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    start_keep_warm()  # wakes the MCP server now, then every 9 min
+    yield
+    await stop_keep_warm()
 
 
 # ============================================================
@@ -18,7 +32,8 @@ from app.api.movies import router as movies_router
 app = FastAPI(
     title="Movie AI Assistant",
     description="AI Movie Recommendation Assistant",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -31,7 +46,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
 
@@ -50,10 +65,9 @@ app.include_router(movies_router)
 
 @app.get("/api")
 def api_status():
-
     return {
         "success": True,
-        "message": "Movie AI Assistant API is running."
+        "message": "Movie AI Assistant API is running.",
     }
 
 
@@ -65,7 +79,7 @@ app.mount(
     "/",
     StaticFiles(
         directory="frontend",
-        html=True
+        html=True,
     ),
-    name="frontend"
+    name="frontend",
 )
