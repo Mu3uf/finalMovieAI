@@ -7,7 +7,7 @@ from app.agent.prompts import system_prompt
 from app.tools.search_movie import search_movie
 from app.tools.trending_movies import trending_movies
 from app.tools.recommend_unwatched_movies import recommend_unwatched_movies
-
+from app.tools.semantic_search import semantic_search
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -25,6 +25,7 @@ tools = [
     search_movie,
     trending_movies,
     recommend_unwatched_movies,
+    semantic_search,
 ]
 
 agent = create_agent(
