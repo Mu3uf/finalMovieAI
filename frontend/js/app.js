@@ -1969,6 +1969,8 @@ async function sendChatMessage(
             setActiveNav(null);
 
             renderMovies(data.movies);
+
+            notifyNewMovies();
         }
 
     } catch (error) {
@@ -2356,6 +2358,228 @@ function extractYear(
     return match
         ? match[0]
         : null;
+
+}
+
+
+// ============================================================
+// MOBILE LAYOUT  (bottom tabs, swipe counter, keyboard-safe height)
+// Only does something on phones; desktop is untouched.
+// ============================================================
+
+const mobileQuery = window.matchMedia(
+    "(max-width: 760px), (max-width: 950px) and (max-height: 500px)"
+);
+
+const tabMovies = document.getElementById("tabMovies");
+
+const tabChat = document.getElementById("tabChat");
+
+const carouselCounter = document.getElementById("carouselCounter");
+
+
+function isMobileLayout() {
+
+    return mobileQuery.matches;
+
+}
+
+
+function setMobileView(view) {
+
+    document.body.classList.toggle("view-show", view === "show");
+
+    document.body.classList.toggle("view-chat", view === "chat");
+
+    if (tabMovies) {
+        tabMovies.classList.toggle("active", view === "show");
+    }
+
+    if (tabChat) {
+        tabChat.classList.toggle("active", view === "chat");
+    }
+
+    if (view === "show") {
+
+        if (tabMovies) {
+            tabMovies.classList.remove("has-update");
+        }
+
+        updateCarouselCounter();
+
+    }
+
+    else {
+
+        scrollChatToBottom();
+
+    }
+
+}
+
+
+function updateCarouselCounter() {
+
+    if (!carouselCounter) {
+        return;
+    }
+
+    const cards = movieGrid.querySelectorAll(".movie-card");
+
+    if (!isMobileLayout() || cards.length === 0) {
+
+        carouselCounter.textContent = "";
+
+        return;
+
+    }
+
+    // hidden view (display:none) has no width yet: keep the old text
+    const step = cards.length > 1
+        ? cards[1].offsetLeft - cards[0].offsetLeft
+        : cards[0].offsetWidth;
+
+    if (step <= 0) {
+        return;
+    }
+
+    const index = Math.min(
+        cards.length - 1,
+        Math.max(0, Math.round(movieGrid.scrollLeft / step))
+    );
+
+    carouselCounter.textContent = `${index + 1} / ${cards.length}`;
+
+}
+
+
+// new cards -> back to the first one and refresh the counter
+new MutationObserver(() => {
+
+    movieGrid.scrollLeft = 0;
+
+    updateCarouselCounter();
+
+}).observe(movieGrid, { childList: true });
+
+movieGrid.addEventListener(
+    "scroll",
+    updateCarouselCounter,
+    { passive: true }
+);
+
+
+// phone: bottom tabs
+if (tabMovies) {
+    tabMovies.addEventListener("click", () => setMobileView("show"));
+}
+
+if (tabChat) {
+    tabChat.addEventListener("click", () => setMobileView("chat"));
+}
+
+
+// phone: top buttons (logo / Discover / Liked / Watched) show the movies
+[
+    logoButton,
+    likedButton,
+    watchedButton,
+    document.getElementById("discoverButton")
+].forEach(button => {
+
+    if (!button) {
+        return;
+    }
+
+    button.addEventListener("click", () => {
+
+        if (isMobileLayout()) {
+            setMobileView("show");
+        }
+
+    });
+
+});
+
+
+// phone: tapping Send must not steal focus from the input, otherwise
+// the keyboard closes, the tab bar pops back and the tap is lost
+sendButton.addEventListener("mousedown", event => {
+
+    event.preventDefault();
+
+});
+
+
+// phone: new recommendations arrived while you are in the chat tab
+function notifyNewMovies() {
+
+    if (
+        !isMobileLayout() ||
+        !document.body.classList.contains("view-chat")
+    ) {
+        return;
+    }
+
+    if (tabMovies) {
+        tabMovies.classList.add("has-update");
+    }
+
+    const content = chatMessages.lastElementChild
+        ? chatMessages.lastElementChild.querySelector(".message-content")
+        : null;
+
+    if (!content) {
+        return;
+    }
+
+    const button = document.createElement("button");
+
+    button.type = "button";
+
+    button.className = "view-movies-button";
+
+    button.textContent = "View movies →";
+
+    button.addEventListener("click", () => setMobileView("show"));
+
+    content.appendChild(button);
+
+    scrollChatToBottom();
+
+}
+
+
+// the page height follows the REAL visible area (address bar, keyboard)
+function syncAppHeight() {
+
+    const height = window.visualViewport
+        ? window.visualViewport.height
+        : window.innerHeight;
+
+    document.documentElement.style.setProperty(
+        "--app-height",
+        `${Math.round(height)}px`
+    );
+
+}
+
+syncAppHeight();
+
+window.addEventListener("resize", syncAppHeight);
+
+if (window.visualViewport) {
+
+    window.visualViewport.addEventListener("resize", syncAppHeight);
+
+    // iOS scrolls the page when the keyboard opens: put it back
+    window.visualViewport.addEventListener("scroll", () => {
+
+        if (isMobileLayout()) {
+            window.scrollTo(0, 0);
+        }
+
+    });
 
 }
 
